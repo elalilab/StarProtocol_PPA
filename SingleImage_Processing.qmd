@@ -1,0 +1,377 @@
+---
+title-block-banner: true
+title: "Creation of point patterns using the spatstat package"
+date: today
+date-format: full
+author: 
+  - name: "Daniel Manrique-Castano"
+    orcid: 0000-0002-1912-1764
+    affiliation: Univerisity Laval (Laboratory of neurovascular interactions) 
+keywords: 
+  - GFAP analysis
+  - Brain injury
+  - Bayesian modeling 
+   
+license: "CC BY"
+
+format:
+   pdf: 
+    toc: true
+    number-sections: true
+    colorlinks: true
+   html:
+    code-fold: true
+    embed-resources: true
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    number-sections: true
+    theme: spacelab
+
+knitr:
+  opts_chunk: 
+    warning: false
+    message: false
+    
+csl: cell.csl
+bibliography: Ref_PointPatterns.bib
+---
+
+# Preview
+
+This notebook is associated with the article "Quantifying the distribution of neurons and glial cells using point pattern analysis (PPA)" published in Star Protocols (DOI: XXXXXXXXXXXX).
+
+**Parent dataset:** Images of mouse brain slices aligned to the Allen brain atlas. The sections were stained with the Glial fibrilary acid protein (GFAP), Ionized calcium binding adaptor molecule-1 (IBA-1) and Neuronal Nuclei (NeuN).
+
+**Working dataset:** .tsv raw data tables generated in QuPath [@bankhead2017] containing individual cell features including coordinates. To download the raw data to replicate this analysis go to https://zenodo.org/records/8399976 and unzip the file `QupathProjects_5x.rar`.
+
+# Install and load required packages
+
+Install and load all required packages. Please uncomment (delete #) the line code if installation is required. Load the installed libraries each time you start a new R session.
+
+```{r}
+#| label: Install_Packages
+#| include: true
+#| warning: false
+#| message: false
+
+library(devtools)
+
+#install.packages(c("dplyr","raster", "readr", "reshape",  "spatstat", "tidyr"))
+
+library(dplyr)
+library(raster)
+library(readr)
+library(reshape)
+library(spatstat)
+library(tidyr)
+
+```
+
+# Process for single files (images)
+
+## Load the files from the working directory
+
+We load the .tsv files located in the working directory. Please note this files are not loaded as a data frame, so further conversion is needed.
+
+```{r}
+#| label: Single_LoadFiles
+#| include: true
+#| warning: false
+#| message: false
+
+# Load the raw data
+NeuN_Table <- read_tsv("DataTables/ECM_Exp2_M01_5D_Scene3_NeuN_detections.tsv")
+Gfap_Table <- read_tsv("DataTables/ECM_Exp2_M01_5D_Scene3_Gfap_detections.tsv")
+
+# Convert to a data frame
+NeuN_Cells <- as.data.frame(NeuN_Table) 
+Gfap_Cells <- as.data.frame(Gfap_Table) 
+```
+
+## Subset the data table
+
+Here, we subset the relevant columns to obtain a clean dataset. Upon screening the tables, we can observe that the xyz coordinates are flipped. This is evident given that the coordinates for x---originally called `Allen CCFv3 X mm`--- has the same value in all rows. This means this column refers to the single coronal plane on which the analysis is being made---all cells in the same plane without depth---For this reason, it is necessary to readjust the coordinates for convinient analysis and plotting, simply by changing the colum names.
+
+Furthermore, depending the number of cells, computational power, and analytical interest, the user can decide to decimate the data set by a certain percentage. In this case, we operate with 10% of the total cells (point coordinates).
+
+Next, we extract the metadata information from the `Image` column. We specify that the strings 3:4 (separated by \_) containing animal ID and experimental condition are the one relevants in this sample case. Note that this information is relevant when the information is grouped by factors for analysis.
+
+Finally, we eliminate additional unnecesary colums and save the clean data set.
+
+```{r}
+#| label: Single_ProcessTables
+#| include: true
+#| warning: false
+#| message: false
+
+# For NeuN cells
+  
+NeuN_Cells <- NeuN_Cells %>%
+  dplyr::select(Image, ObjectID = Name, Region = Parent, Z = `Allen CCFv3 X mm`, Y = `Allen CCFv3 Y mm`, X = `Allen CCFv3 Z mm`) %>%
+  sample_frac(.1) %>%
+  separate(Image, into = c("NA1", "NA2", "MouseID", "DPI"), sep = "[_\\.]", extra = "drop", fill = "right") %>%
+  dplyr::select(-NA1, -NA2, MouseID, DPI, Region, ObjectID, -Z, X, Y)
+  
+# Write a .csv file
+write.csv(NeuN_Cells, "DataTables/NeuN_Cells.csv")
+
+
+# For GFAP cells
+
+Gfap_Cells <- Gfap_Cells %>%
+  dplyr::select(Image, ObjectID = Name, Region = Parent, Z = `Allen CCFv3 X mm`, Y = `Allen CCFv3 Y mm`, X = `Allen CCFv3 Z mm`) %>%
+  sample_frac(.1) %>%
+  separate(Image, into = c("NA1", "NA2", "MouseID", "DPI"), sep = "[_\\.]", extra = "drop", fill = "right") %>%
+  dplyr::select(-NA1, -NA2, MouseID, DPI, Region, ObjectID, -Z, X, Y)
+  
+# Write a .csv file
+write.csv(Gfap_Cells, "DataTables/Gfap_Cells.csv")
+```
+
+## Create the point patterns
+
+We use the `spatstat` package [@baddeley2005; @spatstat-2] to create point patterns. Please refer to the application book [@spatstat] to the to appreciate all the features and functionalities of this R package.
+
+The first step is to rotate the coordinates. As they are in the table, the xy coordinates for the cells plot the brain upside-down. Therefore, a rotation of 180º is required for appropriate positioning.
+
+Then, we set up the limits defining the observation window. In this case our observation window for the two markers will be defined by the NeuN staining. Other observation widow are also suitable. In many scenarios, the limits of a DAPI staining as an observation window is a good choice.
+
+To generate the point patterns, we pass the coordinates columns into the `ppp` function from `spatstat`, specifying the limits. Later, we set a true scale depending on the original image metadata. Finally, using the `convexhull` we set the limits of the observation window (a convex hull) based on the NeuN staining.
+
+```{r}
+#| label: Single_PPP
+#| include: true
+#| warning: false
+#| message: false
+
+# For NeuN cells
+
+# Extract and rotate coordinates
+NeuN_Coords <- cbind(NeuN_Cells$X, NeuN_Cells$Y) 
+NeuN_Coords <- secr::rotate(NeuN_Coords, 180) 
+NeuN_Coords <- as.data.frame(NeuN_Coords)
+NeuN_Cells <- cbind(NeuN_Cells, NeuN_Coords)
+
+## Set up the limits based on NeuN staining
+xlim <- range(NeuN_Cells$V1)
+ylim <- range(NeuN_Cells$V2)
+
+# Create a scaled point pattern
+NeuN_PPP <- ppp(x = NeuN_Cells$V1, y = NeuN_Cells$V2, xrange = xlim, yrange = ylim)
+# Set up the scale according to original image metadata
+unitname(NeuN_PPP)  <- list("mm", "mm", 1.3/1000)
+NeuN_PPP <- spatstat.geom::rescale (NeuN_PPP)
+
+# Establish the observation window
+chull <- convexhull(NeuN_PPP)
+Window(NeuN_PPP) <- chull
+
+
+# For GFAP cells
+
+# Extract and rotate coordinates
+Gfap_Coords <- cbind(Gfap_Cells$X, Gfap_Cells$Y) 
+Gfap_Coords <- secr::rotate(Gfap_Coords, 180) 
+Gfap_Coords <- as.data.frame(Gfap_Coords)
+Gfap_Cells <- cbind(Gfap_Cells, Gfap_Coords)
+
+## Set up the limits based on Gfap staining
+xlim <- range(Gfap_Cells$V1)
+ylim <- range(Gfap_Cells$V2)
+
+# Create a scaled point pattern
+Gfap_PPP <- ppp(x = Gfap_Cells$V1, y = Gfap_Cells$V2, xrange = xlim, yrange = ylim)
+# Set up the scale according to original image metadata
+unitname(Gfap_PPP)  <- list("mm", "mm", 1.3/1000)
+Gfap_PPP <- spatstat.geom::rescale (Gfap_PPP)
+
+# Establish the observation window
+Window(Gfap_PPP) <- chull
+```
+
+## Generate density kernels and tesellations
+
+In this step, we generate density kernels and tessellations for each of the point patterns using the `density` function. The parameter sigma specifies the smoothing bandwidth to be used. A smaller value provides a more "granular" mapping.Please note that the scale of sigma changes according to the scale of the point pattern.
+
+```{r}
+#| label: Single_Density
+#| include: true
+#| warning: false
+#| message: false
+
+# For NeuN cells
+NeuN_Density_01 <- density(NeuN_PPP, sigma =0.0001, positive=TRUE)
+NeuN_Density_02 <- density(NeuN_PPP, sigma =0.0002, positive=TRUE)
+NeuN_Density_05 <- density(NeuN_PPP, sigma =0.0005, positive=TRUE)
+
+# For Gfap cells
+Gfap_Density_01 <- density(Gfap_PPP, sigma =0.0001, positive=TRUE)
+Gfap_Density_02 <- density(Gfap_PPP, sigma =0.0002, positive=TRUE)
+Gfap_Density_05 <- density(Gfap_PPP, sigma =0.0005, positive=TRUE)
+```
+
+Next, we define cell tessellations based on a defined density kernel. In this case, we choose the density kernel comprising a sigma of 0.0002. For the tessellation we generate a quantile to contain regions of "Low" and "High" number of cells. The user can define the any breaks of interest.
+
+With the `quadratcount` function, the user estimates the number (in this case) of GFAP+ cells into regions of low and high neuronal density. Next, we calculate the relative distribution (covariance) of GFAP+ cells in NeuN+ regions using the `rhohat` function from `spatstat`. Converting the rhohat as function provides an estimation of GFAP spatial intensity at a specific value for NeuN intensity.
+
+Additionally, we can estimate the relative distribution to a covariant using a distance map. Thus, we will obtain an estimation of the spatial intensity of GFAP as a function of distance to the nearest NeuN cell.
+
+```{r}
+#| label: Single_Covariance
+#| include: true
+#| warning: false
+#| message: false
+
+# Generate quantiles for tessellation
+Quantiles <- c(0, 30000000, 80000000)
+# establish cut points
+Cut <- cut(NeuN_Density_02, breaks = Quantiles, labels = c("Low", "High"))
+# Define the tessellation
+NeuN_Tess <- tess(image = Cut )
+
+# Perform quadrant counting
+quadratcount(Gfap_PPP, tess = NeuN_Tess)
+
+# Estimate relative distribution (rhohat)
+Gfap_Rhohat <- rhohat(Gfap_PPP, NeuN_Density_02)
+plot(Gfap_Rhohat)
+
+# Convert rhohat to function
+Rhohat_f <- as.function(Gfap_Rhohat)
+
+# Obtain GFAP values for a value of 30000 in NeuN intensity.
+Rhohat_f (30000)
+
+# Estimate relative distribution based on distance (rhohat)
+Gfap_Rhohat_D <- rhohat(Gfap_PPP, distfun(NeuN_PPP))
+plot(Gfap_Rhohat_D)
+```
+
+## Fit a linear poisson model
+
+In this step, we fit a spatial point process model using the `ppm` function from `spatstat`. 
+
+The spatial point process modeled by ppm assumes that the points follow an inhomogeneous Poisson process with intensity function $\lambda(u)$ that varies over space $u$. For the count of points in any spatial region $A$, we follow a Poisson distribution with the mean determined by the spatial integral of the intensity function $\lambda(u)$. Please note that the model results are in the logarithmic scale.
+```{r}
+#| label: Single_Modelling
+#| include: true
+#| warning: false
+#| message: false
+
+# Fit a model without predictors
+Gfap_Modeling1 <- ppm(Gfap_PPP ~ 1)
+
+# Plot the model summary
+summary(Gfap_Modeling1)
+
+# Fit a model with NeuN spatial intensity as a predictor
+Gfap_Modeling2 <- ppm(Gfap_PPP ~ NeuN_Density_02)
+
+# Plot the model summary
+summary(Gfap_Modeling2)
+```
+
+
+## Create raster layers 
+
+In this segment, we create raster layers (https://pro.arcgis.com/en/pro-app/latest/help/data/imagery/introduction-to-raster-data.htm). that represent as a matrix of pixels the density of points in a point pattern. We use the `raster` function from the `raster` package [@raster] to convert density kernels into raster layers and segment regions of high cell density. 
+
+First, we pass the `raster` function to the density kernel. For additional arguments, please check the package documentation. By plotting the raster, the user can visualize the different layers depicting the cell density.Then, the `rasterToPoints` function enables to user to extract the layer of interest by setting a threshold. The resulting object is a matrix with xy coordinates signaling the position of a specific raster layer. This matrix can be plot and analyzed by different means, including centroid, cluster and distance measurements.  
+
+```{r}
+#| label: Single_Raster
+#| include: true
+#| warning: false
+#| message: false
+
+# For GFAP cells
+
+# Create the raster layers
+Gfap_Raster <- raster(Gfap_Density_02)
+
+# Plot the raster layers
+plot(Gfap_Raster)
+
+# Extract the layer with high intensity of cells
+Gfap_High <- rasterToPoints(Gfap_Raster, fun=function(x){x>30000000})
+
+# Plot the extracted points
+plot(Gfap_High)
+
+# For NeuN cells
+
+# Create the raster layers
+NeuN_Raster <- raster(NeuN_Density_02)
+
+# Plot the raster layers
+plot(NeuN_Raster)
+
+# Extract the layer with high intensity of cells
+NeuN_High <- rasterToPoints(NeuN_Raster, fun=function(x){x>60000000})
+
+# Plot the extracted points
+plot(NeuN_High)
+```
+## Quantify the interaction between points 
+
+The `spatstat` package has tools for determining the interaction between points in a point pattern through different functions (f-function, g-function, k-function, etc.) For complete documentation, please refer to the reference book. For this protocol, we will employ the K-function, which can be defined as "the cumulative average number of data points lying within a distance *r* of a typical data point, corrected for edge effects, and standardized by dividing by the intensity" [@spatstat, p. 204].
+
+First, for visualization purposes, we can generate a distance map of the point pattern using the `distmap` function. This will result in a pixel image with color codes. The user can obtain additional information on the distance by using the `pairdist` and `nndist` function, which return a matrix of pairwise distances and a vector of the nearest neighbor distances, respectively. 
+
+To estimate the K-function, we pass the `Kest` and `Kinhom`(for inhomogeneous patterns) functions to the point pattern of interest.
+
+```{r}
+#| label: Single_Interaction
+#| include: true
+#| warning: false
+#| message: false
+
+# For GFAP cells
+
+# Create the distance map
+Gfap_Dist <- distmap(Gfap_PPP)
+
+# Add the observation window
+Window(Gfap_Dist) <- chull
+
+# Plot the distance map
+plot(Gfap_Dist)
+plot(Gfap_PPP, add = TRUE, col = "white", pch = 18, cex= 0.4)
+
+# Calculate the pairwise distances
+Gfap_pairwise <- pairdist(Gfap_PPP)
+
+# Calculate the nn distances
+Gfap_nndist <- nndist(Gfap_PPP)
+
+# Calculate the K function
+Gfap_Kfun <- Kest(Gfap_PPP)
+Gfap_Kfun <- Kinhom(Gfap_PPP)
+
+# For NeuN cells
+
+# Create the distance map
+NeuN_Dist <- distmap(NeuN_PPP)
+
+# Add the observation window
+Window(NeuN_Dist) <- chull
+
+# Plot the distance map
+plot(NeuN_Dist)
+plot(NeuN_PPP, add = TRUE, col = "white", pch = 18, cex= 0.4)
+
+# Calculate the pairwise distances
+NeuN_pairwise <- pairdist(NeuN_PPP)
+
+# Calculate the nn distances
+NeuN_nndist <- nndist(NeuN_PPP)
+
+# Calculate the K function
+NeuN_Kfun <- Kest(NeuN_PPP)
+plot(NeuN_Kfun)
+
+NeuN_Kfun <- Kinhom(NeuN_PPP)
+plot(Gfap_Kfun)
+```
+
