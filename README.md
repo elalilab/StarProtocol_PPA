@@ -1,6 +1,6 @@
-# Unbiased quantification of the spatial distribution of cells using Point pattern analysis (PPA)(StarProtocols).
+# Unbiased quantification of the spatial distribution of murine cells using Point pattern analysis (PPA)
 
-This repository contains the material associated with the Star Protocol for Point Pattern Analysis (PPA) (XXXXXXx). 
+This repository contains the material associated with the **StarProtocol** for Point pattern analysis (PPA).
 
 ## Files
 
